@@ -1,0 +1,275 @@
+services:
+  postgres:
+    image: postgres:15
+    container_name: task-tracker-postgres
+    environment:
+      POSTGRES_USER: ${DB_USER}       
+      POSTGRES_PASSWORD: ${DB_PASSWORD}   
+      POSTGRES_DB: ${DB_NAME}      
+    ports:
+      - "${POSTGRES_PORT}:${DB_PORT}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - task-tracker-network
+    volumes:
+       - db:/var/lib/postgresql/data
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.11
+    container_name: clickhouse-server
+    ports:
+      - "8123:8123"
+      - "9001:9001"
+    environment:
+      - CLICKHOUSE_DB=track
+      - CLICKHOUSE_USER=click
+      - CLICKHOUSE_PASSWORD=clickhouse  
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_config:/etc/clickhouse-server
+    restart: always
+
+
+  migrations:
+    image: migrate/migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_HOST: ${DB_HOST}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME}
+      DB_PORT: ${DB_PORT}
+    networks:
+      - task-tracker-network
+    volumes:
+      - ./migrations:/migrations 
+    entrypoint: ["migrate"]
+    command: 
+      - "-path=/migrations"
+      - "-database=postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:5432/${DB_NAME}?sslmode=disable"
+      - "up"
+    restart: on-failure
+
+  redis:
+    image: redis:7.2.5-alpine3.20
+    container_name: task-tracker-redis
+
+    env_file:
+      - .env
+    ports:
+      - ${EXTERNAL_REDIS_PORT}:6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - task-tracker-network
+    
+  kafka:
+    image: confluentinc/cp-kafka:7.9.0
+    container_name: kafka
+    ports:
+      - "${KAFKA_EXTERNAL_PORT}:${KAFKA_EXTERNAL_PORT}"
+    env_file:
+      - .env
+    environment: 
+      KAFKA_KRAFT_MODE: "true"  
+
+      KAFKA_PROCESS_ROLES: controller,broker 
+
+      KAFKA_NODE_ID: 1
+
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:${KAFKA_CONTROLLER_PORT}"
+      
+
+
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:${KAFKA_INTERNAL_PORT},PLAINTEXT_EXTERNAL://0.0.0.0:${KAFKA_EXTERNAL_PORT},CONTROLLER://kafka:${KAFKA_CONTROLLER_PORT}
+
+
+
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+
+
+
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+
+
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:${KAFKA_INTERNAL_PORT},PLAINTEXT_EXTERNAL://localhost:${KAFKA_EXTERNAL_PORT},CONTROLLER://kafka:${KAFKA_CONTROLLER_PORT}
+
+
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+ 
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+
+      KAFKA_LOG_RETENTION_HOURS: 168
+
+
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+
+      CLUSTER_ID: "Mk3OEYBSD34fcwNTJENDM2Qk"
+
+
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "bash",
+          "-c",
+          "echo > /dev/tcp/localhost/${KAFKA_INTERNAL_PORT}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - task-tracker-network
+      
+  kafka-init:
+    image: confluentinc/cp-kafka:7.9.0
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - task-tracker-network
+    env_file:
+      - .env 
+    environment:
+      KAFKA_INTERNAL_PORT: ${KAFKA_INTERNAL_PORT} 
+    volumes:
+      - ./init-kafka.sh:/init-kafka.sh
+    command: ["/bin/bash", "/init-kafka.sh"]
+    restart: "no"
+
+  kafka-ui: 
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: kafka-ui
+    ports:
+      - "${KAFKA_UI_PORT}:8080"
+    env_file:
+      - .env
+
+    environment:
+      KAFKA_CLUSTERS_0_NAME: "local-cluster"
+
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: "kafka:${KAFKA_INTERNAL_PORT}"
+      
+
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+      
+
+
+    restart: unless-stopped
+    
+
+    networks:
+      - task-tracker-network
+      
+  app:
+    image: task-tracker-back:v1
+    ports:
+      - '${APP_PORT}:${APP_PORT}'
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=${DB_HOST}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=${DB_NAME}
+      - DB_PORT=${DB_PORT}
+      - APP_PORT=${APP_PORT}
+      - KAFKA_BROKERS=${KAFKA_BROKERS}
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+    volumes:
+      - ./.env:/app/.env 
+    depends_on:
+      scheduler:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks:
+      - task-tracker-network
+    restart: unless-stopped
+  
+  email-sender:
+    image: task-tracker-email-sender:v1 
+    ports:
+      - '${EMAIL_SENDER_PORT}:${EMAIL_SENDER_PORT}'
+    env_file:
+      - .env
+    environment:
+      - EMAIL_SENDER_PORT=${EMAIL_SENDER_PORT}
+    volumes:
+      - ./.env:/app/.env 
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    networks:
+      - task-tracker-network
+    restart: unless-stopped
+  scheduler:
+    image: task-tracker-scheduler:v1 
+    ports:
+      - '${SCHEDULER_PORT}:${SCHEDULER_PORT}'
+    volumes:
+      - ./.env:/app/.env 
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    networks:
+      - task-tracker-network
+    restart: unless-stopped
+
+
+volumes: 
+  kafka_data:
+  db:
+  clickhouse_data:
+  clickhouse_config:
+
+networks:
+  task-tracker-network:
+    driver: bridge
