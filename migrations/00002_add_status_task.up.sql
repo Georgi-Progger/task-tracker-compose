@@ -1,0 +1,3 @@
+CREATE TYPE status AS ENUM ('COMPLETE', 'IN_PROGRESS', 'CREATE');
+
+ALTER TABLE tasks ADD COLUMN task_status status;
